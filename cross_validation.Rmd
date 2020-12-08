@@ -1,0 +1,225 @@
+---
+title: "Cross Validation"
+output: github_document
+author: David Nemirovsky
+---
+
+```{r setup, include = F}
+library(tidyverse)
+library(modelr)
+library(mgcv)
+
+knitr::opts_chunk$set(
+  fig.width = 7,
+  fig.asp = .6,
+  out.width = "95%"
+)
+
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
+
+options(
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis"
+)
+
+scale_colour_discrete = scale_colour_viridis_d
+scale_fill_discrete = scale_fill_viridis_d
+
+set.seed(1)
+```
+
+## Simulate data
+
+```{r}
+nonlin_df = 
+  tibble(
+    id = 1:100,
+    x = runif(100, 0, 1),
+    y = 1 - 10 * (x - .3) ^ 2 + rnorm(100, 0, .3)
+  )
+
+nonlin_df %>% 
+  ggplot(aes(x = x, y = y)) + 
+  geom_point()
+```
+
+## Cross-validation by hand
+
+Get training and testing datasets:
+
+```{r}
+train_df = sample_n(nonlin_df, 80)
+test_df = anti_join(nonlin_df, train_df, by = "id")
+
+ggplot(train_df, aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_point(data = test_df, color = "red")
+```
+
+Fit three models:
+
+```{r}
+linear_mod = lm(y ~ x, data = train_df)
+smooth_mod = mgcv::gam(y ~ s(x), data = train_df)
+wiggly_mod = mgcv::gam(y ~ s(x, k = 30), sp = 10e-6, data = train_df)
+```
+
+Can I see what I just did?
+
+```{r}
+train_df %>% 
+  gather_predictions(linear_mod, smooth_mod, wiggly_mod) %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_line(aes(y = pred), color = "red") + 
+  facet_wrap(~model)
+```
+
+Look at prediction accuracy:
+
+```{r}
+rmse(linear_mod, test_df)
+rmse(smooth_mod, test_df)
+rmse(wiggly_mod, test_df)
+```
+
+## Cross Validation using `modelr`
+
+```{r}
+cv_df = 
+  crossv_mc(nonlin_df, 100)
+```
+
+What is happening here?
+
+```{r}
+cv_df %>% pull(train) %>% .[[1]] %>% as_tibble()
+cv_df %>% pull(test) %>% .[[1]] %>% as_tibble()
+```
+
+```{r}
+cv_df =
+  cv_df %>% 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble))
+```
+
+Let's try to fit models and get RMSEs in them:
+
+```{r}
+cv_df =  
+  cv_df %>% 
+  mutate(
+    linear_mod  = map(train, ~lm(y ~ x, data = .x)),
+    smooth_mod  = map(train, ~mgcv::gam(y ~ s(x), data = .x)),
+    wiggly_mod  = map(train, ~gam(y ~ s(x, k = 30), sp = 10e-6, data = .x))) %>% 
+  mutate(
+    rmse_linear = map2_dbl(linear_mod, test, ~rmse(model = .x, data = .y)),
+    rmse_smooth = map2_dbl(smooth_mod, test, ~rmse(model = .x, data = .y)),
+    rmse_wiggly = map2_dbl(wiggly_mod, test, ~rmse(model = .x, data = .y)))
+```
+
+What do these results say about model choice?
+
+```{r}
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+Compute averages:
+
+```{r}
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") %>% 
+  group_by(model) %>% 
+  summarize(avg = mean(rmse))
+```
+
+## Try on a real dataset
+
+```{r}
+child_growth = 
+  read_csv("./nepalese_children.csv") %>% 
+  mutate(weight_cp = (weight > 7) * (weight - 7))
+```
+
+weight vs arm circumference
+
+```{r}
+child_growth %>% 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = 0.3)
+```
+
+Fit the models I care about:
+
+```{r}
+linear_mod = lm(armc ~ weight, data = child_growth)
+pwl_mod    = lm(armc ~ weight + weight_cp, data = child_growth)
+smooth_mod = gam(armc ~ s(weight), data = child_growth)
+```
+
+```{r}
+child_growth %>% 
+  gather_predictions(linear_mod, pwl_mod, smooth_mod) %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = .5) +
+  geom_line(aes(y = pred), color = "red") + 
+  facet_grid(~model)
+```
+
+Try to understand model fit using CV:
+
+```{r}
+cv_df =
+  crossv_mc(child_growth, 100) %>% 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble))
+```
+
+Se if I can fit the models to the splits:
+
+```{r}
+cv_df = 
+  cv_df %>% 
+  mutate(
+    linear_mod  = map(train, ~lm(armc ~ weight, data = .x)),
+    pwl_mod     = map(train, ~lm(armc ~ weight + weight_cp, data = .x)),
+    smooth_mod  = map(train, ~gam(armc ~ s(weight), data = as_tibble(.x)))) %>% 
+  mutate(
+    rmse_linear = map2_dbl(linear_mod, test, ~rmse(model = .x, data = .y)),
+    rmse_pwl    = map2_dbl(pwl_mod, test, ~rmse(model = .x, data = .y)),
+    rmse_smooth = map2_dbl(smooth_mod, test, ~rmse(model = .x, data = .y)))
+```
+
+Violin plots of RMSEs:
+
+```{r}
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+Pick the piece-wise b/c it's easier to explain!
